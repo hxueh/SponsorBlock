@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         SponsorBlock Lite
 // @namespace    https://sponsor.ajay.app
-// @version      1.0.0
+// @version      1.1.0
 // @description  Auto-skip sponsor segments on YouTube using SponsorBlock API
 // @author       SponsorBlock
 // @match        https://www.youtube.com/*
 // @match        https://music.youtube.com/*
+// @match        https://m.youtube.com/*
 // @icon         https://sponsor.ajay.app/LogoSponsorBlock256px.png
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
