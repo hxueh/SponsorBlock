@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SponsorBlock Lite
 // @namespace    https://sponsor.ajay.app
-// @version      1.1.0
+// @version      1.2.0
 // @description  Auto-skip sponsor segments on YouTube using SponsorBlock API
 // @author       SponsorBlock
 // @match        https://www.youtube.com/*
@@ -60,13 +60,19 @@
     let videoChangeDebounce = null;
     let previewBarContainer = null;
     let videoDuration = 0;
+    let lastUrl = location.href;
+    let urlPollInterval = null;
+    let videoObserver = null;
 
+    // Platform detection
     const IS_MUSIC_YOUTUBE = window.location.hostname === "music.youtube.com";
+    const IS_MOBILE_YOUTUBE = window.location.hostname === "m.youtube.com";
 
     // ==================== CSS INJECTION ====================
 
     function injectStyles() {
         const css = `
+            /* Desktop YouTube styles */
             #sb-lite-previewbar {
                 position: absolute;
                 width: 100%;
@@ -81,18 +87,36 @@
                 transition: transform 0.1s cubic-bezier(0, 0, 0.2, 1);
             }
 
-            /* Expand on hover */
+            /* Expand on hover (desktop) */
             .ytp-progress-bar:hover #sb-lite-previewbar {
                 transform: scaleY(1);
             }
 
-            /* Fullscreen mode */
+            /* Fullscreen mode (desktop) */
             .ytp-big-mode #sb-lite-previewbar {
                 transform: scaleY(0.625);
             }
 
             .ytp-big-mode .ytp-progress-bar:hover #sb-lite-previewbar {
                 transform: scaleY(1);
+            }
+
+            /* Mobile YouTube styles */
+            .advancement-bar-line #sb-lite-previewbar,
+            .advancement-bar #sb-lite-previewbar,
+            .progress-bar-line #sb-lite-previewbar {
+                position: absolute;
+                width: 100%;
+                height: 100%;
+                top: 0;
+                left: 0;
+                padding: 0;
+                margin: 0;
+                overflow: visible;
+                pointer-events: none;
+                z-index: 42;
+                list-style: none;
+                transform: none;
             }
 
             .sb-lite-segment {
@@ -120,6 +144,14 @@
                 white-space: nowrap;
                 cursor: default;
                 user-select: none;
+            }
+
+            /* Mobile category pill adjustments */
+            .ytm-slim-owner-container #sb-lite-category-pill,
+            ytm-slim-owner-renderer #sb-lite-category-pill {
+                font-size: 10px;
+                padding: 2px 8px;
+                margin-left: 4px;
             }
         `;
 
@@ -163,11 +195,23 @@
         const liveMatch = url.pathname.match(/\/live\/([a-zA-Z0-9_-]{11})/);
         if (liveMatch) return liveMatch[1];
 
+        // Mobile watch URL pattern
+        const watchMatch = url.pathname.match(/\/watch\/([a-zA-Z0-9_-]{11})/);
+        if (watchMatch) return watchMatch[1];
+
         return null;
     }
 
     function getVideoDuration() {
         return video?.duration || 0;
+    }
+
+    function log(message, ...args) {
+        console.log(`[SB Lite${IS_MOBILE_YOUTUBE ? " Mobile" : ""}]`, message, ...args);
+    }
+
+    function logError(message, ...args) {
+        console.error(`[SB Lite${IS_MOBILE_YOUTUBE ? " Mobile" : ""}]`, message, ...args);
     }
 
     // ==================== API FUNCTIONS ====================
@@ -270,6 +314,7 @@
         if (currentTime >= startTime - SKIP_BUFFER) {
             if (lastSkippedUUID !== nextSegment.UUID) {
                 lastSkippedUUID = nextSegment.UUID;
+                log(`Skipping ${nextSegment.category} segment`);
                 skipToTime(endTime);
                 currentSegmentIndex++;
             }
@@ -290,6 +335,7 @@
             ) {
                 if (lastSkippedUUID !== nextSegment.UUID) {
                     lastSkippedUUID = nextSegment.UUID;
+                    log(`Skipping ${nextSegment.category} segment`);
                     skipToTime(endTime);
                     currentSegmentIndex++;
                 }
@@ -335,6 +381,17 @@
             progressBar = document.querySelector("#progress-bar");
         }
 
+        // Mobile YouTube - try multiple selectors
+        if (!progressBar && IS_MOBILE_YOUTUBE) {
+            progressBar =
+                document.querySelector(".progress-bar-line") ||
+                document.querySelector(".advancement-bar-line") ||
+                document.querySelector(".advancement-bar") ||
+                document.querySelector("ytm-player .progress-bar") ||
+                document.querySelector(".player-controls-content .progress-bar-line") ||
+                document.querySelector("[class*='progress-bar']");
+        }
+
         return progressBar;
     }
 
@@ -365,10 +422,18 @@
         // Attach to progress bar if not already attached
         const progressBar = getProgressBar();
         if (progressBar && !progressBar.contains(previewBarContainer)) {
+            // Ensure progress bar has relative positioning for absolute children
+            const computedStyle = window.getComputedStyle(progressBar);
+            if (computedStyle.position === "static") {
+                progressBar.style.position = "relative";
+            }
             progressBar.appendChild(previewBarContainer);
         }
 
-        if (!progressBar) return;
+        if (!progressBar) {
+            log("Progress bar not found, will retry...");
+            return;
+        }
 
         // Clear existing bars
         clearPreviewBar();
@@ -409,11 +474,22 @@
         }
 
         let titleContainer = null;
+
         if (IS_MUSIC_YOUTUBE) {
             titleContainer = document.querySelector(
                 "ytmusic-player-bar .title",
             );
+        } else if (IS_MOBILE_YOUTUBE) {
+            // Mobile YouTube title selectors
+            titleContainer =
+                document.querySelector(".slim-video-metadata-header .slim-owner-icon-and-title") ||
+                document.querySelector("ytm-slim-owner-renderer") ||
+                document.querySelector(".slim-video-information-title") ||
+                document.querySelector(".slim-video-metadata-title") ||
+                document.querySelector("[class*='video-title']") ||
+                document.querySelector("h2.slim-video-information-title");
         } else {
+            // Desktop YouTube
             titleContainer =
                 document.querySelector("#above-the-fold #title h1") ||
                 document.querySelector("ytd-watch-metadata #title h1") ||
@@ -500,15 +576,84 @@
                 updatePreviewBar();
             }
         });
+
+        // Handle timeupdate for mobile (fallback skip mechanism)
+        if (IS_MOBILE_YOUTUBE) {
+            video.addEventListener("timeupdate", () => {
+                if (!video.paused && skippableSegments.length > 0) {
+                    const currentTime = video.currentTime;
+                    for (const seg of skippableSegments) {
+                        const [startTime, endTime] = seg.segment;
+                        if (
+                            currentTime >= startTime &&
+                            currentTime < endTime - SKIP_BUFFER &&
+                            lastSkippedUUID !== seg.UUID
+                        ) {
+                            lastSkippedUUID = seg.UUID;
+                            log(`Skipping ${seg.category} segment (timeupdate fallback)`);
+                            skipToTime(endTime);
+                            break;
+                        }
+                    }
+                }
+            });
+        }
     }
 
     function findVideoElement() {
+        // Desktop selectors
         video =
             document.querySelector("video.html5-main-video") ||
             document.querySelector("video.video-stream") ||
-            document.querySelector("#movie_player video") ||
-            document.querySelector("video");
+            document.querySelector("#movie_player video");
+
+        // Mobile selectors
+        if (!video && IS_MOBILE_YOUTUBE) {
+            video =
+                document.querySelector("ytm-player video") ||
+                document.querySelector(".player-container video") ||
+                document.querySelector(".html5-video-container video") ||
+                document.querySelector(".video-stream") ||
+                document.querySelector("video[playsinline]") ||
+                document.querySelector("video");
+        }
+
+        // Fallback
+        if (!video) {
+            video = document.querySelector("video");
+        }
+
         return video;
+    }
+
+    // ==================== MUTATION OBSERVER FOR VIDEO ====================
+
+    function setupVideoObserver() {
+        if (videoObserver) {
+            videoObserver.disconnect();
+        }
+
+        videoObserver = new MutationObserver((mutations) => {
+            // Check if video element was added
+            if (!video || !document.contains(video)) {
+                const newVideo = findVideoElement();
+                if (newVideo && newVideo !== video) {
+                    video = newVideo;
+                    log("Video element detected via observer");
+                    if (currentVideoID) {
+                        setupVideoListeners();
+                        if (segments.length > 0 && !video.paused) {
+                            scheduleSkips();
+                        }
+                    }
+                }
+            }
+        });
+
+        videoObserver.observe(document.body, {
+            childList: true,
+            subtree: true,
+        });
     }
 
     // ==================== NAVIGATION & INITIALIZATION ====================
@@ -537,9 +682,7 @@
             segments = await fetchSegments(currentVideoID);
 
             if (segments.length > 0) {
-                console.log(
-                    `[SB Lite] Found ${segments.length} segments for video ${currentVideoID}`,
-                );
+                log(`Found ${segments.length} segments for video ${currentVideoID}`);
             }
 
             computeSkippableSegments();
@@ -550,8 +693,15 @@
             if (video && !video.paused) {
                 scheduleSkips();
             }
+
+            // Retry preview bar attachment after a delay (for slow-loading mobile UI)
+            if (IS_MOBILE_YOUTUBE && segments.length > 0) {
+                setTimeout(updatePreviewBar, 1000);
+                setTimeout(updatePreviewBar, 2000);
+                setTimeout(updateCategoryPill, 1000);
+            }
         } catch (error) {
-            console.error("[SB Lite] Failed to load segments:", error);
+            logError("Failed to load segments:", error);
         }
     }
 
@@ -562,6 +712,7 @@
             return;
         }
 
+        log(`Video changed to: ${newVideoID}`);
         resetState();
         currentVideoID = newVideoID;
 
@@ -572,9 +723,11 @@
             attempts++;
             if (findVideoElement()) {
                 clearInterval(checkVideo);
+                log("Video element found after", attempts, "attempts");
                 loadSegmentsAndSetup();
             } else if (attempts >= maxAttempts) {
                 clearInterval(checkVideo);
+                logError("Failed to find video element after max attempts");
             }
         }, 100);
     }
@@ -587,36 +740,79 @@
     }
 
     function setupNavigationListener() {
-        document.addEventListener("yt-navigate-finish", handleVideoChange);
+        // Standard YouTube navigation events (may not fire on mobile)
+        document.addEventListener("yt-navigate-finish", () => {
+            log("yt-navigate-finish event");
+            handleVideoChange();
+        });
 
         document.addEventListener("yt-navigate-start", () => {
             hideCategoryPill();
             removePreviewBar();
         });
 
+        // Mobile-specific events
+        if (IS_MOBILE_YOUTUBE) {
+            document.addEventListener("state-navigateend", () => {
+                log("state-navigateend event");
+                handleVideoChange();
+            });
+
+            document.addEventListener("yt-page-data-updated", () => {
+                log("yt-page-data-updated event");
+                handleVideoChange();
+            });
+        }
+
+        // History API interception
         const originalPushState = history.pushState;
         history.pushState = function (...args) {
             originalPushState.apply(this, args);
+            log("pushState detected");
             handleVideoChange();
         };
 
         const originalReplaceState = history.replaceState;
         history.replaceState = function (...args) {
             originalReplaceState.apply(this, args);
+            log("replaceState detected");
             handleVideoChange();
         };
 
-        window.addEventListener("popstate", handleVideoChange);
+        window.addEventListener("popstate", () => {
+            log("popstate event");
+            handleVideoChange();
+        });
+
+        // URL polling fallback (essential for mobile)
+        urlPollInterval = setInterval(() => {
+            if (location.href !== lastUrl) {
+                log("URL change detected via polling:", location.href);
+                lastUrl = location.href;
+                handleVideoChange();
+            }
+        }, 500);
     }
 
     function init() {
-        console.log("[SB Lite] Initializing SponsorBlock Lite");
+        log("Initializing SponsorBlock Lite");
+        log("Platform:", IS_MOBILE_YOUTUBE ? "Mobile" : IS_MUSIC_YOUTUBE ? "Music" : "Desktop");
 
         injectStyles();
         setupNavigationListener();
+        setupVideoObserver();
         handleVideoChange();
 
+        // Multiple retry attempts for initial load
+        setTimeout(handleVideoChange, 500);
         setTimeout(handleVideoChange, 1000);
+        setTimeout(handleVideoChange, 2000);
+
+        // Additional mobile-specific retries
+        if (IS_MOBILE_YOUTUBE) {
+            setTimeout(handleVideoChange, 3000);
+            setTimeout(handleVideoChange, 5000);
+        }
     }
 
     // ==================== START ====================
